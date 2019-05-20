@@ -2,6 +2,9 @@
 
 
 namespace App\Console\Commands\Properties;
+use App\Models\BitrixProperty;
+use App\Models\BitrixSection;
+use App\Models\CompareBlockProperty;
 use Illuminate\Support\Facades\DB;
 
 class BitrixProperties
@@ -18,6 +21,184 @@ class BitrixProperties
         $selectQuery='SELECT * FROM bitrix_properties';
             return  DB::Connection("mysql2")->select($selectQuery);
 
+    }
+    /**
+     * Стучимся напрямую в БД, ибо на%#@% этот тормозной Bitrix
+     *
+     * @param BitrixProperty[]|CompareBlockProperty[] $properties
+     * @return \Illuminate\Database\Query\Builder
+     */
+    public static function getQueryForProducts($properties, $categories)
+    {
+        $responseRaw = \DB::connection('mysql2')
+            ->table('b_iblock_element as BE')// Таблица товаров
+            ->addSelect(['BE.ID', 'BE.NAME', 'CAT_PR.QUANTITY', 'IB.CANONICAL_PAGE_URL'])// Получаем ID, название, кол-во и шаблон канонической ссылки
+            ->addSelect(['BE.CODE', 'BE.IBLOCK_SECTION_ID'])
+            ->addSelect('BE.ACTIVE')
+            ->addSelect(\DB::raw('IF((ISNULL(FPS0.PROPERTY_214) OR FPS0.PROPERTY_214 != \'Y\') AND `CAT_PR`.`QUANTITY` >= 5, ROUND(PR.PRICE * 0.95) - MOD(ROUND(PR.PRICE * 0.95), 10), PR.PRICE) as PRICE'))// Получаем цену товара
+            ->addSelect(\DB::raw('CONCAT(\'https://vsestiralnie.com/upload/\', F.SUBDIR, \'/\', F.FILE_NAME) as PREVIEW_IMAGE'))// Получаем нормальную ссылку на Preview картинку
+            ->addSelect(\DB::raw('ROUND(FPS0.PROPERTY_238) as MARJA'))// Получаем маржу товара
+            ->join('b_iblock_element_prop_s17 as FPS0', 'FPS0.IBLOCK_ELEMENT_ID', '=', 'BE.ID')// Таблица свойств
+            ->leftJoin('b_catalog_product as CAT_PR', 'CAT_PR.ID', '=', 'BE.ID')// Таблица каталога
+            ->leftJoin('b_iblock as IB', 'IB.ID', '=', 'BE.IBLOCK_ID')// Таблица инфоблока
+            ->leftJoin('b_catalog_price as PR', function ($join) { // Таблица цен каталога
+                $join->on('PR.PRODUCT_ID', '=', 'BE.ID');
+                $join->where('PR.CATALOG_GROUP_ID', '=', '1');
+            })
+            ->leftJoin('b_file as F', 'BE.DETAIL_PICTURE', '=', 'F.ID')
+            ->joinSub('
+                    SELECT DISTINCT BSE.IBLOCK_ELEMENT_ID
+                    FROM b_iblock_section_element BSE
+                    
+                    INNER JOIN b_iblock_section BSubS ON BSE.IBLOCK_SECTION_ID = BSubS.ID
+                    INNER JOIN b_iblock_section BS ON (BSubS.IBLOCK_ID=BS.IBLOCK_ID
+                        AND BSubS.LEFT_MARGIN>=BS.LEFT_MARGIN
+                        AND BSubS.RIGHT_MARGIN<=BS.RIGHT_MARGIN)
+                    
+                    WHERE (BS.ID IN (' . $categories . ')) AND  (BSubS.ACTIVE = \'Y\') AND (BSubS.GLOBAL_ACTIVE = \'Y\')
+            ', 'BES', 'BES.IBLOCK_ELEMENT_ID', '=', 'BE.ID');
+
+
+        /** @var BitrixProperty|CompareBlockProperty $property */
+        foreach ($properties as $property) {
+            // Получаем значения ENUM, где нет множественного значения
+            if ($property->property_type === 'L' && $property->multiple === 0) {
+                $pSelect = 'FPEN' . $property->property_id;
+
+                // Таблица с значениями enum для свойства
+                $responseRaw->leftJoin('b_iblock_property_enum as ' . $pSelect, function ($join) use ($pSelect, $property) {
+                    $join->on('FPS0.PROPERTY_' . $property->property_id, '=', $pSelect . '.ID');
+                    $join->where($pSelect . '.PROPERTY_ID', '=', $property->property_id);
+                });
+
+                // Выбираем значения
+                $responseRaw->addSelect($pSelect . '.VALUE as PROPERTY_' . $property->property_id . '_VALUE');
+                $responseRaw->addSelect($pSelect . '.ID as PROPERTY_' . $property->property_id . '_ENUM_ID');
+            } else if ($property->property_type === 'E' && $property->multiple === 0) {
+                $pSelect = 'FPEN' . $property->property_id;
+
+                $responseRaw->leftJoin('b_iblock_element as ' . $pSelect, $pSelect . '.ID', '=', 'FPS0.PROPERTY_' . $property->property_id);
+
+                $responseRaw->addSelect($pSelect . '.NAME as PROPERTY_' . $property->property_id . '_VALUE');
+                $responseRaw->addSelect($pSelect . '.ID as PROPERTY_' . $property->property_id . '_ENUM_ID');
+            } else {
+                $responseRaw->addSelect('FPS0.PROPERTY_' . $property->property_id . ' as PROPERTY_' . $property->property_id . '_VALUE');
+            }
+        }
+
+        return $responseRaw;
+    }
+
+    /**
+     * @param BitrixProperty[]|CompareBlockProperty[] $properties
+     * @param array $responseKey
+     */
+    public static function postQueryProduct($properties, &$responseKey)
+    {
+        /** @var BitrixProperty|CompareBlockProperty $property */
+        foreach ($properties as $property) {
+            if ($property->property_type === 'L' && $property->multiple === 1) { // Получаем значения свойства списка с множественным значением
+                // Десериализация значения (На%&@@#$ Bitrix, вот н^$%@$я это просто?!)
+                $value = unserialize($responseKey['PROPERTY_' . $property->property_id . '_VALUE']);
+
+                if(empty($value['VALUE'])) {
+                    $responseKey['PROPERTY_' . $property->property_id . '_VALUE'] = [];
+                } else {
+
+                    // Получаем значения элементов
+                    $responseRaw2 = \DB::connection('mysql2')
+                        ->table('b_iblock_property_enum')
+                        ->where('PROPERTY_ID', '=', $property->bitrix_id)
+                        ->whereIn('ID', $value['VALUE'])
+                        ->get();
+
+                    // Создаём новые значения для свойства
+                    $valueReal = [];
+                    foreach ($responseRaw2 as $responseField) {
+                        $valueReal[$responseField->ID] = $responseField->VALUE;
+                    }
+
+                    // Устанавливаем новое значение
+                    $responseKey['PROPERTY_' . $property->property_id . '_VALUE'] = $valueReal;
+                }
+
+            } else if ($property->property_type === 'S' && $property->multiple === 1 && $property->userType == 'directory') { // Получаем значения свойства строки с множественным значением (Цвета)
+                // Десериализация значения
+                $value = unserialize($responseKey['PROPERTY_' . $property->property_id . '_VALUE']);
+
+                if (!empty($value['VALUE'])) {
+
+                    // Достаём настройки пользовательского типа данных
+                    $userTypeSettings = json_decode($property->user_type_settings);
+                    if (!$userTypeSettings) {
+                        continue;
+                    }
+
+                    // Получаем значения элементов
+                    $responseRaw2 = \DB::connection('mysql2')
+                        ->table($userTypeSettings->TABLE_NAME)
+                        ->whereIn('UF_XML_ID', $value['VALUE'])
+                        ->get();
+
+                    // Создаём новые значения для свойства
+                    $valueReal = [];
+                    foreach ($responseRaw2 as $responseField) {
+                        $valueReal[$responseField->UF_XML_ID] = $responseField->UF_NAME;
+                    }
+
+                    // Устанавливаем новое значение
+                    $responseKey['PROPERTY_' . $property->property_id . '_VALUE'] = $valueReal;
+                } else {
+                    // Устанавливаем пустое значение
+                    $responseKey['PROPERTY_' . $property->property_id . '_VALUE'] = [];
+                }
+
+            } else if ($property->property_type === 'F' && $property->multiple === 1) { // Получаем файлы
+                // Десериализация значения
+                $value = unserialize($responseKey['PROPERTY_' . $property->property_id . '_VALUE']);
+
+                if (!empty($value['VALUE'])) {
+
+                    // Получаем файлы по ID
+                    $responseRaw2 = \DB::connection('mysql2')
+                        ->table('b_file')
+                        ->whereIn('ID', $value['VALUE'])
+                        ->get();
+
+                    // Создаём новые значения для свойства
+                    $valueReal = [];
+                    foreach ($responseRaw2 as $responseField) {
+                        $valueReal[$responseField->ID] = 'https://vsestiralnie.com/upload/' . $responseField->SUBDIR . '/' . $responseField->FILE_NAME;
+                    }
+
+                    // Устанавливаем новое значение
+                    $responseKey['PROPERTY_' . $property->property_id . '_VALUE'] = $valueReal;
+                } else {
+                    // Устанавливаем пустое значение
+                    $responseKey['PROPERTY_' . $property->property_id . '_VALUE'] = [];
+                }
+            } else if ($property->property_type === 'N' && $property->multiple === 0) {
+                // https://stackoverflow.com/questions/14531679/remove-useless-zero-digits-from-decimals-in-php
+                $responseKey['PROPERTY_' . $property->property_id . '_VALUE'] += 0; // Трюк с превращение в число
+            }
+        }
+
+        if (isset($responseKey['CANONICAL_PAGE_URL']) && isset($responseKey['CODE']) && isset($responseKey['IBLOCK_SECTION_ID'])) {
+            $page_url = str_replace('#SERVER_NAME#', 'vsestiralnie.com', $responseKey['CANONICAL_PAGE_URL']);
+
+            $bitrixSection = BitrixSection::whereBitrixId((int)$responseKey['IBLOCK_SECTION_ID'])->first();
+
+            if ($bitrixSection) {
+                $page_url = str_replace('#SECTION_CODE_PATH#', $bitrixSection->full_code_path, $page_url);
+                $page_url = str_replace('#ELEMENT_CODE#', $responseKey['CODE'], $page_url);
+            }
+
+            $responseKey['CANONICAL_PAGE_URL'] = $page_url;
+        }
+
+        if (isset($responseKey['MARJA']) && (int)$responseKey['MARJA'] !== 0) {
+            $responseKey['MARJA'] = round(($responseKey['MARJA'] - 600 - 200) * 9 / 100 / 50) * 50;
+        }
     }
 
 }
